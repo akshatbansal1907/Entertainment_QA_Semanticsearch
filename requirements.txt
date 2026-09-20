@@ -4,3 +4,9 @@ scikit-learn>=1.4,<2
 sentence-transformers>=3,<4
 transformers>=4.40,<5
 torch>=2.2,<3
+gradio
+sentence-transformers
+transformers
+torch
+pandas
+numpy
