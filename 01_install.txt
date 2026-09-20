@@ -1,0 +1,4 @@
+# Install dependencies in Google Colab (run this cell first)
+!pip -q install -U sentence-transformers transformers torch scikit-learn gradio
+
+# Optional: if your runtime has a very old/broken Gradio, restart the runtime after installation.
