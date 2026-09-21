@@ -1,146 +1,53 @@
 # -*- coding: utf-8 -*-
-
 """
 Experiment 7 - Entertainment Semantic Search + Lightweight Extractive QA
 
-Render 512 MB optimized version:
-- Uses TF-IDF + cosine similarity for document retrieval.
-- Does not use PyTorch or Transformers.
-- Uses lightweight sentence scoring for extractive-style answers.
-- Loads only small scikit-learn components.
-- Supports documents stored in ./documents/*.txt.
+512 MB Render-friendly version:
+- Uses TF-IDF and cosine similarity for document retrieval.
+- Uses sentence-level TF-IDF matching for lightweight answer extraction.
+- Does not use PyTorch, Transformers, or Sentence-Transformers.
 """
 
 from pathlib import Path
-import gc
 import os
 import re
+import gc
 
-# Keep numerical libraries lightweight on Render.
+# Limit numerical-library threads before importing sklearn.
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import gradio as gr
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 
-# ---------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------
-
 BASE_DIR = Path(__file__).resolve().parent
 DOC_DIR = BASE_DIR / "documents"
 
+RELEVANCE_THRESHOLD = 0.03
 MAX_DOCUMENT_CHARS = 12000
-MAX_CONTEXT_SENTENCES = 5
-MIN_SIMILARITY = 0.03
+MAX_SENTENCES = 80
+MAX_ANSWER_CHARS = 650
 
 ENTERTAINMENT_TERMS = {
     "movie", "movies", "film", "films", "cinema", "actor", "actors",
-    "director", "directors", "genre", "genres", "music", "song", "songs",
-    "singer", "instrument", "instruments", "video", "game", "games",
-    "gaming", "player", "players", "book", "books", "novel", "novels",
-    "reading", "read", "poetry", "poem", "poems", "theater", "theatre",
-    "play", "plays", "musical", "stage", "acting", "performance",
-    "entertainment", "story", "stories", "character", "characters",
-    "audience", "literature", "rpg", "puzzle", "strategy", "thriller",
-    "comedy", "drama", "romance", "documentary", "fantasy", "adventure",
-    "action", "jazz", "rock", "pop", "classical", "hip-hop", "hiphop"
+    "director", "genre", "genres", "music", "song", "songs", "singer",
+    "instrument", "video", "game", "games", "gaming", "player", "players",
+    "book", "books", "novel", "novels", "reading", "read", "poetry",
+    "poem", "theater", "theatre", "play", "plays", "musical", "stage",
+    "acting", "performance", "entertainment", "story", "stories",
+    "character", "characters", "audience", "literature", "rpg", "puzzle",
+    "strategy", "thriller", "comedy", "drama", "romance", "documentary",
+    "fantasy", "adventure", "action", "jazz", "rock", "pop", "classical",
+    "hip-hop"
 }
 
 
-# ---------------------------------------------------------
-# Document loading
-# ---------------------------------------------------------
-
-def load_documents():
-    """
-    Load text documents from ./documents.
-
-    A fallback is included for files named doc*.txt in the
-    repository root, so deployment does not fail if the files
-    were uploaded in the root directory.
-    """
-    paths = sorted(DOC_DIR.glob("*.txt")) if DOC_DIR.exists() else []
-
-    if not paths:
-        paths = sorted(BASE_DIR.glob("doc*.txt"))
-
-    loaded_texts = []
-    loaded_names = []
-
-    for path in paths:
-        try:
-            text = path.read_text(
-                encoding="utf-8",
-                errors="ignore"
-            ).strip()
-        except OSError as exc:
-            print(f"Could not read {path.name}: {exc}", flush=True)
-            continue
-
-        if text:
-            loaded_texts.append(text[:MAX_DOCUMENT_CHARS])
-            loaded_names.append(path.name)
-
-    if len(loaded_texts) < 1:
-        raise FileNotFoundError(
-            "No non-empty TXT documents were found. "
-            "Add files inside the documents folder."
-        )
-
-    return loaded_texts, loaded_names
-
-
-documents, document_names = load_documents()
-
-# Fit one small TF-IDF matrix during startup.
-vectorizer = TfidfVectorizer(
-    lowercase=True,
-    stop_words="english",
-    ngram_range=(1, 2),
-    max_features=3500,
-    sublinear_tf=True,
-    dtype="float32"
-)
-
-document_matrix = vectorizer.fit_transform(documents)
-
-# Release temporary objects where possible.
-gc.collect()
-
-
-# ---------------------------------------------------------
-# Text processing helpers
-# ---------------------------------------------------------
-
 def normalize_words(text):
-    return set(
-        re.findall(r"[a-zA-Z][a-zA-Z0-9'-]*", (text or "").lower())
-    )
-
-
-def tokenize_words(text):
-    return re.findall(
-        r"[a-zA-Z][a-zA-Z0-9'-]*",
-        (text or "").lower()
-    )
-
-
-def clean_text(text):
-    return re.sub(r"\s+", " ", text or "").strip()
-
-
-def clean_answer(text):
-    text = clean_text(text)
-    if not text:
-        return ""
-
-    return text[0].upper() + text[1:]
+    return set(re.findall(r"[a-zA-Z][a-zA-Z'-]*", text.lower()))
 
 
 def looks_like_entertainment_question(question):
@@ -148,136 +55,203 @@ def looks_like_entertainment_question(question):
 
 
 def split_sentences(text):
-    """
-    Simple sentence splitter that works well for short TXT files.
-    """
-    text = clean_text(text)
-
+    text = re.sub(r"\s+", " ", text).strip()
     if not text:
         return []
 
     sentences = re.split(r"(?<=[.!?])\s+", text)
-    return [sentence.strip() for sentence in sentences if sentence.strip()]
+    cleaned = []
+
+    for sentence in sentences:
+        sentence = sentence.strip(" -•\t")
+        if len(sentence) >= 20:
+            cleaned.append(sentence)
+
+    return cleaned[:MAX_SENTENCES]
 
 
-# ---------------------------------------------------------
-# TF-IDF retrieval
-# ---------------------------------------------------------
+def shorten_answer(text):
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"^(answer|response)\s*:\s*", "", text, flags=re.I)
+
+    # Remove repeated leading document headings when they are attached
+    # directly to the actual sentence.
+    text = re.sub(
+        r"^(movies?\s+and\s+genres?|music\s+and\s+genres?)\s+",
+        "",
+        text,
+        flags=re.I
+    ).strip()
+
+    if len(text) > MAX_ANSWER_CHARS:
+        clipped = text[:MAX_ANSWER_CHARS]
+        last_stop = max(
+            clipped.rfind("."),
+            clipped.rfind(";"),
+            clipped.rfind(",")
+        )
+        if last_stop >= 120:
+            text = clipped[:last_stop + 1]
+        else:
+            text = clipped.rsplit(" ", 1)[0] + "..."
+
+    if text:
+        text = text[0].upper() + text[1:]
+
+    return text
+
+
+def load_documents():
+    if not DOC_DIR.exists():
+        raise FileNotFoundError(
+            f"Document folder not found: {DOC_DIR}. "
+            "Create a documents folder containing TXT files."
+        )
+
+    paths = sorted(DOC_DIR.glob("*.txt"))
+    names = []
+    texts = []
+
+    for path in paths:
+        try:
+            text = path.read_text(
+                encoding="utf-8",
+                errors="ignore"
+            ).strip()
+        except OSError:
+            continue
+
+        if text:
+            names.append(path.name)
+            texts.append(text[:MAX_DOCUMENT_CHARS])
+
+    if len(texts) < 5:
+        raise RuntimeError(
+            f"At least five non-empty TXT documents are required; "
+            f"found {len(texts)}."
+        )
+
+    return names, texts
+
+
+document_names, documents = load_documents()
+
+# Document-level retrieval.
+document_vectorizer = TfidfVectorizer(
+    lowercase=True,
+    stop_words="english",
+    ngram_range=(1, 2),
+    max_features=5000,
+    dtype="float32"
+)
+
+document_matrix = document_vectorizer.fit_transform(documents)
+
+# Sentence-level data for each document.
+document_sentences = [split_sentences(text) for text in documents]
+
+sentence_vectorizers = []
+sentence_matrices = []
+
+for sentences in document_sentences:
+    if sentences:
+        vectorizer = TfidfVectorizer(
+            lowercase=True,
+            stop_words="english",
+            ngram_range=(1, 2),
+            max_features=2500,
+            dtype="float32"
+        )
+        matrix = vectorizer.fit_transform(sentences)
+    else:
+        vectorizer = None
+        matrix = None
+
+    sentence_vectorizers.append(vectorizer)
+    sentence_matrices.append(matrix)
+
+gc.collect()
+
 
 def semantic_search(question):
-    query_matrix = vectorizer.transform([question])
+    query_matrix = document_vectorizer.transform([question])
     scores = cosine_similarity(query_matrix, document_matrix)[0]
-
     best_index = int(scores.argmax())
 
     return (
+        best_index,
         document_names[best_index],
-        float(scores[best_index]),
-        best_index
+        float(scores[best_index])
     )
 
 
-# ---------------------------------------------------------
-# Lightweight extractive-style answer selection
-# ---------------------------------------------------------
-
-def sentence_score(sentence, question, document_score=0.0):
-    """
-    Score a sentence using:
-    - Question-word overlap
-    - Important non-stopword overlap
-    - Small preference for concise sentences
-
-    This is intentionally lightweight and does not use a QA model.
-    """
+def sentence_score(question, sentence, vectorizer, matrix):
     question_words = normalize_words(question)
     sentence_words = normalize_words(sentence)
 
-    if not question_words or not sentence_words:
-        return 0.0
+    overlap = len(question_words & sentence_words)
+    normalized_overlap = overlap / max(len(question_words), 1)
 
-    overlap = question_words & sentence_words
-    overlap_score = len(overlap) / max(len(question_words), 1)
+    query_vector = vectorizer.transform([question])
+    similarity = float(cosine_similarity(query_vector, matrix)[0].max())
 
-    # Give a little extra weight to words appearing in the query.
-    exact_word_score = sum(
-        1 for word in tokenize_words(question)
-        if word in sentence_words
-    ) / max(len(tokenize_words(question)), 1)
-
-    # Avoid selecting extremely long sentences when scores are close.
-    length_penalty = min(len(sentence) / 500.0, 1.0) * 0.08
-
-    return (
-        (overlap_score * 0.62)
-        + (exact_word_score * 0.38)
-        - length_penalty
-        + (document_score * 0.05)
-    )
+    # Word overlap helps with short questions such as:
+    # "What are popular movie genres?"
+    score = (0.70 * similarity) + (0.30 * normalized_overlap)
+    return score
 
 
-def extractive_style_answer(question, context):
-    """
-    Select the most relevant sentence(s) from the selected document.
-    """
-    sentences = split_sentences(context)
+def extract_lightweight_answer(question, doc_index):
+    sentences = document_sentences[doc_index]
+    vectorizer = sentence_vectorizers[doc_index]
+    matrix = sentence_matrices[doc_index]
 
-    if not sentences:
+    if not sentences or vectorizer is None or matrix is None:
         return "", 0.0
 
-    ranked = sorted(
-        (
-            (
-                sentence_score(sentence, question),
-                index,
-                sentence
-            )
-            for index, sentence in enumerate(sentences)
-        ),
-        key=lambda item: item[0],
-        reverse=True
-    )
+    question_words = normalize_words(question)
+    query_vector = vectorizer.transform([question])
+    similarities = cosine_similarity(query_vector, matrix)[0]
 
-    best_score, best_index, best_sentence = ranked[0]
+    ranked = []
 
-    if best_score <= 0:
-        fallback = " ".join(sentences[:2])
-        return clean_answer(fallback[:900]), 0.0
+    for index, sentence in enumerate(sentences):
+        sentence_words = normalize_words(sentence)
+        overlap = len(question_words & sentence_words)
+        normalized_overlap = overlap / max(len(question_words), 1)
 
+        score = (
+            0.70 * float(similarities[index])
+            + 0.30 * normalized_overlap
+        )
+
+        ranked.append((score, overlap, index, sentence))
+
+    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+
+    best_score, best_overlap, best_index, best_sentence = ranked[0]
+
+    # Select one sentence by default. A second sentence is included only
+    # when it has a similar score and adds useful information.
     selected = [best_sentence]
-    used_length = len(best_sentence)
 
-    # Add up to a few nearby high-scoring sentences when useful.
-    for score, index, sentence in ranked[1:]:
-        if len(selected) >= MAX_CONTEXT_SENTENCES:
-            break
+    if len(ranked) > 1:
+        second_score, second_overlap, second_index, second_sentence = ranked[1]
 
-        if score <= best_score * 0.55:
-            continue
+        if (
+            second_index != best_index
+            and second_score >= best_score * 0.82
+            and second_overlap >= 1
+            and len(best_sentence) + len(second_sentence) < MAX_ANSWER_CHARS
+        ):
+            selected.append(second_sentence)
 
-        if used_length + len(sentence) + 1 > 900:
-            continue
+    answer = shorten_answer(" ".join(selected))
 
-        # Prefer sentences near the best sentence.
-        if abs(index - best_index) <= 2:
-            selected.append(sentence)
-            used_length += len(sentence) + 1
+    # A small confidence-like value for the lightweight matching method.
+    confidence = min(1.0, max(0.0, float(best_score)))
+    return answer, confidence
 
-    # Preserve document order for readability.
-    selected = sorted(
-        selected,
-        key=lambda sentence: sentences.index(sentence)
-    )
-
-    answer = clean_answer(" ".join(selected))
-    confidence = max(0.0, min(float(best_score), 1.0))
-
-    return answer[:1200], confidence
-
-
-# ---------------------------------------------------------
-# Main QA workflow
-# ---------------------------------------------------------
 
 def hybrid_qa_system(question):
     if not question or not question.strip():
@@ -289,38 +263,35 @@ def hybrid_qa_system(question):
             "Ask about movies, music, video games, books, or theater."
         )
 
-    question = clean_text(question)
+    question = question.strip()
 
     try:
-        source_doc, similarity, best_index = semantic_search(question)
+        doc_index, source_doc, similarity = semantic_search(question)
 
         if (
-            similarity < MIN_SIMILARITY
+            similarity < RELEVANCE_THRESHOLD
             and not looks_like_entertainment_question(question)
         ):
             return (
-                "Sorry, this question is outside the assigned "
-                "entertainment topic.",
+                "Sorry, this question is outside the assigned entertainment topic.",
                 "N/A",
                 f"{similarity:.4f}",
-                "Out of scope",
+                "Lightweight confidence: 0.0000",
                 "Only entertainment-related questions are accepted."
             )
 
-        context = documents[best_index]
-
-        answer, confidence = extractive_style_answer(
+        answer, confidence = extract_lightweight_answer(
             question,
-            context
+            doc_index
         )
 
         if not answer:
             return (
-                "The relevant document was found, but no answer "
+                "The relevant document was found, but no concise answer "
                 "could be extracted.",
                 source_doc,
                 f"{similarity:.4f}",
-                "0.0000",
+                "Lightweight confidence: 0.0000",
                 "Try a shorter and more specific question."
             )
 
@@ -334,10 +305,8 @@ def hybrid_qa_system(question):
 
     except Exception as exc:
         print(f"Application error: {exc}", flush=True)
-
         return (
-            "The question could not be processed. "
-            "Please try a shorter question.",
+            "The question could not be processed. Please try a shorter question.",
             "N/A",
             "N/A",
             "QA error",
@@ -345,36 +314,24 @@ def hybrid_qa_system(question):
         )
 
 
-# ---------------------------------------------------------
-# Gradio interface
-# ---------------------------------------------------------
-
 with gr.Blocks(
     title="Entertainment QA & Semantic Search Engine"
 ) as demo:
-
     gr.Markdown("# 🎬 Entertainment QA & Semantic Search Engine")
 
     gr.Markdown(
-        "Experiment 7: **TF-IDF Semantic Search + Lightweight "
-        "Extractive-Style Question Answering.** "
-        "The system selects the most relevant entertainment "
-        "document and extracts relevant sentence(s)."
+        "Experiment 7: **Semantic Search + Lightweight Extractive "
+        "Question Answering.** The system selects the most relevant "
+        "entertainment document and returns the most relevant sentence."
     )
 
     question_box = gr.Textbox(
         label="Your Question",
-        placeholder=(
-            "Example: Which movie genres can encourage "
-            "deeper thinking?"
-        ),
+        placeholder="Example: Which movie genres can encourage deeper thinking?",
         lines=2
     )
 
-    ask_button = gr.Button(
-        "🔎 Find Answer",
-        variant="primary"
-    )
+    ask_button = gr.Button("🔎 Find Answer", variant="primary")
 
     similarity_box = gr.Textbox(
         label="Document Similarity Score",
